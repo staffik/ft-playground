@@ -28,7 +28,7 @@ use near_sdk::borsh::BorshSerialize;
 use near_sdk::collections::LazyOption;
 use near_sdk::json_types::U128;
 use near_sdk::{
-    env, log, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, PromiseOrValue,
+    assert_one_yocto, env, log, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, PromiseOrValue,
 };
 
 #[derive(PanicOnDefault)]
@@ -36,6 +36,11 @@ use near_sdk::{
 pub struct Contract {
     token: FungibleToken,
     metadata: LazyOption<FungibleTokenMetadata>,
+    owner_id: AccountId,
+}
+
+pub trait Mintable {
+    fn mint(&mut self, receiver_id: AccountId, amount: U128);
 }
 
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
@@ -49,13 +54,11 @@ enum StorageKey {
 
 #[near]
 impl Contract {
-    /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// default metadata (for example purposes only).
+    /// Initializes the contract with the given owner and default metadata (for example purposes only).
     #[init]
-    pub fn new_default_meta(owner_id: AccountId, total_supply: U128) -> Self {
+    pub fn new_default_meta(owner_id: AccountId) -> Self {
         Self::new(
             owner_id,
-            total_supply,
             FungibleTokenMetadata {
                 spec: FT_METADATA_SPEC.to_string(),
                 name: "Example NEAR fungible token".to_string(),
@@ -68,27 +71,34 @@ impl Contract {
         )
     }
 
-    /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// the given fungible token metadata.
+    /// Initializes the contract with the given owner and the given fungible token metadata.
     #[init]
-    pub fn new(owner_id: AccountId, total_supply: U128, metadata: FungibleTokenMetadata) -> Self {
+    pub fn new(owner_id: AccountId, metadata: FungibleTokenMetadata) -> Self {
         require!(!env::state_exists(), "Already initialized");
         metadata.assert_valid();
-        let mut this = Self {
+        Self {
             token: FungibleToken::new(StorageKey::FungibleToken),
             metadata: LazyOption::new(StorageKey::Metadata, Some(&metadata)),
-        };
-        this.token.internal_register_account(&owner_id);
-        this.token.internal_deposit(&owner_id, total_supply.into());
+            owner_id: owner_id.clone(),
+        }
+    }
+}
 
+#[near]
+impl Mintable for Contract {
+    #[payable]
+    fn mint(&mut self, receiver_id: AccountId, amount: U128) {
+        assert_one_yocto();
+        require!(amount > U128(0), "The amount should be a positive number");
+        let sender_id = env::predecessor_account_id();
+        require!(sender_id == self.owner_id, "Not an owner");
+        self.token.internal_deposit(&receiver_id, amount.into());
         near_contract_standards::fungible_token::events::FtMint {
-            owner_id: &owner_id,
-            amount: total_supply,
+            owner_id: &receiver_id,
+            amount,
             memo: Some("new tokens are minted"),
         }
         .emit();
-
-        this
     }
 }
 
@@ -189,7 +199,7 @@ mod tests {
 
     use super::*;
 
-    const TOTAL_SUPPLY: Balance = 1_000_000_000_000_000;
+    const INITIAL_BALANCE: Balance = 1_000_000_000;
 
     fn current() -> AccountId {
         accounts(0)
@@ -207,10 +217,10 @@ mod tests {
         accounts(3)
     }
 
-    fn setup() -> (Contract, VMContextBuilder) {
+    fn setup_default() -> (Contract, VMContextBuilder) {
         let mut context = VMContextBuilder::new();
 
-        let contract = Contract::new_default_meta(owner(), TOTAL_SUPPLY.into());
+        let contract = Contract::new_default_meta(owner());
 
         context.storage_usage(env::storage_usage());
         context.current_account_id(current());
@@ -220,12 +230,41 @@ mod tests {
         (contract, context)
     }
 
+    fn setup() -> (Contract, VMContextBuilder) {
+        let (mut contract, mut context) = setup_default();
+
+        // Register the owner
+        testing_env!(context
+            .predecessor_account_id(owner())
+            .attached_deposit(contract.storage_balance_bounds().min)
+            .build());
+        contract.storage_deposit(None, None);
+
+        // Mint initial suppply
+        testing_env!(context
+            .predecessor_account_id(owner())
+            .attached_deposit(NearToken::from_yoctonear(1))
+            .build());
+        contract.mint(owner(), INITIAL_BALANCE.into());
+
+        (contract, context)
+    }
+
     #[test]
     fn test_new() {
+        let (contract, _) = setup_default();
+
+        assert_eq!(contract.ft_total_supply().0, 0);
+        assert!(contract.storage_balance_of(owner()).is_none());
+        assert_eq!(contract.ft_balance_of(owner()).0, 0);
+    }
+
+    #[test]
+    fn test_setup() {
         let (contract, _) = setup();
 
-        assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY);
-        assert_eq!(contract.ft_balance_of(owner()).0, TOTAL_SUPPLY);
+        assert_eq!(contract.ft_total_supply().0, INITIAL_BALANCE);
+        assert_eq!(contract.ft_balance_of(owner()).0, INITIAL_BALANCE);
     }
 
     #[test]
@@ -400,7 +439,7 @@ mod tests {
             .predecessor_account_id(owner())
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE;
 
         contract.ft_transfer(user1(), transfer_amount.into(), None);
 
@@ -429,7 +468,7 @@ mod tests {
             .predecessor_account_id(owner())
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE;
 
         contract.ft_transfer(user1(), transfer_amount.into(), None);
 
@@ -444,7 +483,7 @@ mod tests {
 
         assert!(contract.storage_balance_of(user1()).is_none());
         assert_eq!(contract.ft_balance_of(user1()).0, 0);
-        assert_eq!(contract.ft_total_supply().0, TOTAL_SUPPLY - transfer_amount);
+        assert_eq!(contract.ft_total_supply().0, INITIAL_BALANCE - transfer_amount);
     }
 
     #[test]
@@ -534,13 +573,13 @@ mod tests {
             .predecessor_account_id(owner())
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
 
         contract.ft_transfer(user1(), transfer_amount.into(), None);
 
         assert_eq!(
             contract.ft_balance_of(owner()).0,
-            (TOTAL_SUPPLY - transfer_amount)
+            (INITIAL_BALANCE - transfer_amount)
         );
         assert_eq!(contract.ft_balance_of(user1()).0, transfer_amount);
     }
@@ -562,7 +601,7 @@ mod tests {
             .predecessor_account_id(owner())
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
 
         contract.ft_transfer(owner(), transfer_amount.into(), None);
     }
@@ -606,7 +645,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(0))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
         contract.ft_transfer(user1(), transfer_amount.into(), None);
     }
 
@@ -620,7 +659,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
         contract.ft_transfer(user1(), transfer_amount.into(), None);
     }
 
@@ -634,7 +673,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
         contract.ft_transfer(user1(), transfer_amount.into(), None);
     }
 
@@ -656,7 +695,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY + 10;
+        let transfer_amount = INITIAL_BALANCE + 10;
         contract.ft_transfer(user1(), transfer_amount.into(), None);
     }
 
@@ -676,13 +715,13 @@ mod tests {
             .predecessor_account_id(owner())
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
 
         contract.ft_transfer_call(user1(), transfer_amount.into(), None, "".to_string());
 
         assert_eq!(
             contract.ft_balance_of(owner()).0,
-            (TOTAL_SUPPLY - transfer_amount)
+            (INITIAL_BALANCE - transfer_amount)
         );
         assert_eq!(contract.ft_balance_of(user1()).0, transfer_amount);
     }
@@ -704,7 +743,7 @@ mod tests {
             .predecessor_account_id(owner())
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
 
         contract.ft_transfer_call(owner(), transfer_amount.into(), None, "".to_string());
     }
@@ -748,7 +787,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(0))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
         contract.ft_transfer_call(user1(), transfer_amount.into(), None, "".to_string());
     }
 
@@ -762,7 +801,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
         contract.ft_transfer_call(user1(), transfer_amount.into(), None, "".to_string());
     }
 
@@ -776,7 +815,7 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
         contract.ft_transfer_call(user1(), transfer_amount.into(), None, "".to_string());
     }
 
@@ -798,9 +837,10 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .build());
 
-        let transfer_amount = TOTAL_SUPPLY + 10;
+        let transfer_amount = INITIAL_BALANCE + 10;
         contract.ft_transfer_call(user1(), transfer_amount.into(), None, "".to_string());
     }
+
     #[should_panic]
     #[test]
     fn test_transfer_call_panics_on_unsufficient_gas() {
@@ -819,8 +859,77 @@ mod tests {
             .attached_deposit(NearToken::from_yoctonear(1))
             .prepaid_gas(Gas::from_tgas(10))
             .build());
-        let transfer_amount = TOTAL_SUPPLY / 10;
+        let transfer_amount = INITIAL_BALANCE / 10;
 
         contract.ft_transfer_call(user1(), transfer_amount.into(), None, "".to_string());
+    }
+
+    #[test]
+    fn test_mint() {
+        let (mut contract, mut context) = setup();
+
+        testing_env!(context
+            .predecessor_account_id(user1())
+            .attached_deposit(contract.storage_balance_bounds().min)
+            .build());
+        contract.storage_deposit(None, None);
+
+        testing_env!(context
+            .predecessor_account_id(owner())
+            .attached_deposit(NearToken::from_yoctonear(1))
+            .build());
+        contract.mint(user1(), INITIAL_BALANCE.into());
+
+        assert_eq!(contract.ft_total_supply().0, INITIAL_BALANCE * 2);
+        assert_eq!(contract.ft_balance_of(owner()).0, INITIAL_BALANCE);
+        assert_eq!(contract.ft_balance_of(user1()).0, INITIAL_BALANCE);
+    }
+
+    #[should_panic]
+    #[test]
+    fn test_mint_panics_on_non_owner() {
+        let (mut contract, mut context) = setup();
+
+        testing_env!(context
+            .predecessor_account_id(user1())
+            .attached_deposit(NearToken::from_yoctonear(1))
+            .build());
+        contract.mint(owner(), INITIAL_BALANCE.into());
+    }
+
+    #[should_panic]
+    #[test]
+    fn test_mint_panics_on_zero_deposit() {
+        let (mut contract, mut context) = setup();
+
+        testing_env!(context
+            .predecessor_account_id(owner())
+            .attached_deposit(NearToken::from_yoctonear(0))
+            .build());
+        contract.mint(owner(), INITIAL_BALANCE.into());
+    }
+
+    #[should_panic]
+    #[test]
+    fn test_mint_panics_on_zero_amount() {
+        let (mut contract, mut context) = setup();
+
+        testing_env!(context
+            .predecessor_account_id(owner())
+            .attached_deposit(NearToken::from_yoctonear(1))
+            .build());
+        contract.mint(owner(), U128(0));
+    }
+
+    #[should_panic]
+    #[test]
+    fn test_mint_panics_on_unregistered_receiver() {
+        let (mut contract, mut context) = setup();
+
+        testing_env!(context
+            .predecessor_account_id(owner())
+            .attached_deposit(NearToken::from_yoctonear(1))
+            .build());
+        contract.mint(user1(), INITIAL_BALANCE.into());
     }
 }

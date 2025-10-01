@@ -74,8 +74,19 @@ pub async fn init_contracts(
 
     let res = ft_contract
         .call("new_default_meta")
+        .args_json((ft_contract.id(),))
+        .max_gas()
+        .transact()
+        .await?;
+    assert!(res.is_success());
+
+    register_user(&ft_contract, ft_contract.id()).await?;
+
+    let res = ft_contract
+        .call("mint")
         .args_json((ft_contract.id(), initial_balance))
         .max_gas()
+        .deposit(ONE_YOCTO)
         .transact()
         .await?;
     assert!(res.is_success());
