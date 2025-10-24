@@ -1,9 +1,9 @@
 [package]
 name = "fungible-token"
 version = "1.0.0"
-authors = ["Near Inc <hello@nearprotocol.com>", "graphite"]
+authors = ["Near Inc <hello@nearprotocol.com>", "graphite", "staffik"]
 edition = "2018"
-repository = "https://github.com/graphite/ft-playground"
+repository = "https://github.com/staffik/ft-playground"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
